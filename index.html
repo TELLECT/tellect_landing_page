@@ -460,8 +460,11 @@
   </footer>
 
   <script>
-    // Check if backend is running
-    const BACKEND_URL = 'http://localhost:3000';
+    // Backend API base. Update this to match your deployment.
+    const BACKEND_URL =
+      window.location.hostname === 'localhost'
+        ? 'http://localhost:3000'
+        : 'https://tellect-landing-page-backend.onrender.com';
 
     // Form submission
     const form = document.getElementById('waitlistForm');
@@ -469,6 +472,11 @@
     const successScreen = document.getElementById('successScreen');
     const continueBtn = document.getElementById('continueBtn');
     const displayedEmail = document.getElementById('displayedEmail');
+
+    function resetSubmitBtn() {
+      submitBtn.classList.remove('loading');
+      submitBtn.disabled = false;
+    }
 
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
@@ -501,30 +509,32 @@
           displayedEmail.textContent = email;
           successScreen.classList.add('visible');
 
-          // Reset form after delay
           setTimeout(() => {
             successScreen.classList.remove('visible');
             form.reset();
-            submitBtn.classList.remove('loading');
-            submitBtn.disabled = false;
+            resetSubmitBtn();
           }, 5000);
-        } else {
-          alert(data.error || 'Something went wrong. Please try again.');
-          submitBtn.classList.remove('loading');
-          submitBtn.disabled = false;
+          return;
         }
-      } catch (error) {
-        // Backend not running - show local success
-        console.log('Backend not running, showing local success', error);
-        successScreen.classList.add('visible');
-        displayedEmail.textContent = email;
 
-        setTimeout(() => {
-          successScreen.classList.remove('visible');
-          form.reset();
-          submitBtn.classList.remove('loading');
-          submitBtn.disabled = false;
-        }, 5000);
+        if (response.status === 409) {
+          // Already on the waitlist — show the success screen anyway.
+          displayedEmail.textContent = email;
+          successScreen.classList.add('visible');
+          setTimeout(() => {
+            successScreen.classList.remove('visible');
+            form.reset();
+            resetSubmitBtn();
+          }, 5000);
+          return;
+        }
+
+        alert(data.error || 'Something went wrong. Please try again.');
+        resetSubmitBtn();
+      } catch (error) {
+        console.error('Waitlist submission failed:', error);
+        alert('Could not reach the server. Please check your connection and try again.');
+        resetSubmitBtn();
       }
     });
 

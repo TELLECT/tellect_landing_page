@@ -1,158 +1,219 @@
-// Simple Waitlist Backend
-// Captures emails and can be configured to use Postgres or in-memory storage
+// Tellect Campus — Waitlist Backend
+// Captures waitlist emails into PostgreSQL (falls back to in-memory if unavailable).
+// Also serves the static landing page (index.html) so a single Render service is enough.
 
 const express = require('express');
 const bodyParser = require('body-parser');
+const path = require('path');
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Try to use Postgres, fallback to in-memory
-let emails = [];
+// ---------------------------------------------------------------------------
+// Static frontend
+// ---------------------------------------------------------------------------
+app.use(express.static(path.join(__dirname, '..')));
+
+// ---------------------------------------------------------------------------
+// Storage
+// ---------------------------------------------------------------------------
+let pool = null;
 let usingPostgres = false;
 
-// Check if pg is available
-try {
-  const { Pool } = require('pg');
-  const connectionString = process.env.DATABASE_URL || 'postgresql://localhost:5432/tellect_waitlist';
-  
-  try {
-    const pool = new Pool({
-      connectionString,
-      connectionTimeoutMillis: 2000,
-    });
-    
-    // Test the connection
-    pool.query('SELECT NOW()', (err, res) => {
-      if (!err) {
-        usingPostgres = true;
-        emails = []; // Will be fetched from DB on startup
-        console.log('✅ Connected to Postgres database');
-      }
-    });
-    
-    // Set up a periodic fetch from DB
-    setInterval(() => {
-      pool.query('SELECT email, created_at FROM waitlist_emails ORDER BY created_at DESC LIMIT 10', (err, res) => {
-        if (!err && res.rowCount > 0) {
-          emails = res.rows.map(r => ({ email: r.email, created_at: r.created_at }));
-        }
-      });
-    }, 10000);
-    
-  } catch (pgErr) {
-    console.warn('⚠️ Postgres connection failed, using in-memory storage:', pgErr.message);
-    usingPostgres = false;
+// In-memory fallback
+let memoryEmails = [];
+
+function buildPoolConfig() {
+  const connectionString =
+    process.env.DATABASE_URL || 'postgresql://localhost:5432/tellect_waitlist';
+
+  const config = {
+    connectionString,
+    connectionTimeoutMillis: 10000,
+    idleTimeoutMillis: 30000,
+  };
+
+  // Hosted Postgres providers (Render, Neon, Supabase, etc.) require TLS.
+  // `pg` honours `sslmode=require` in the URL; for other hosts we force SSL on.
+  const needsSsl =
+    /sslmode=require/i.test(connectionString) ||
+    /render\.com|neon\.tech|supabase\.co|amazonaws\.com|azure\.com/i.test(connectionString);
+
+  if (needsSsl) {
+    config.ssl = { rejectUnauthorized: false };
   }
-} catch (e) {
-  console.warn('⚠️ pg module not found, using in-memory storage:', e.message);
-  usingPostgres = false;
+
+  return config;
 }
 
+async function initPostgres() {
+  try {
+    const { Pool } = require('pg');
+    pool = new Pool(buildPoolConfig());
+
+    // Fail fast if the DB is unreachable so we fall back gracefully.
+    await pool.query('SELECT 1');
+
+    // Make sure the table exists (idempotent).
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS waitlist_emails (
+        id SERIAL PRIMARY KEY,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      )
+    `);
+
+    usingPostgres = true;
+    console.log('✅ Connected to Postgres — waitlist_emails table ready');
+  } catch (err) {
+    usingPostgres = false;
+    pool = null;
+    console.warn(`⚠️ Postgres unavailable (${err.message}) — using in-memory storage`);
+  }
+}
+
+async function saveEmail(email) {
+  if (usingPostgres && pool) {
+    const { rows } = await pool.query(
+      `INSERT INTO waitlist_emails (email, created_at)
+       VALUES ($1, NOW())
+       ON CONFLICT (email) DO NOTHING
+       RETURNING id, email, created_at`,
+      [email]
+    );
+
+    // rows is empty when the email already existed (conflict).
+    return { saved: 'postgres', created: rows.length > 0, record: rows[0] || null };
+  }
+
+  const exists = memoryEmails.some((e) => e.email === email);
+  if (!exists) {
+    memoryEmails.push({ email, created_at: new Date().toISOString() });
+  }
+  return { saved: 'memory', created: !exists, record: null };
+}
+
+async function listEmails() {
+  if (usingPostgres && pool) {
+    const { rows } = await pool.query(
+      'SELECT email, created_at FROM waitlist_emails ORDER BY created_at DESC'
+    );
+    return rows;
+  }
+  return [...memoryEmails].reverse();
+}
+
+async function clearEmails() {
+  if (usingPostgres && pool) {
+    await pool.query('DELETE FROM waitlist_emails');
+  }
+  memoryEmails = [];
+}
+
+// ---------------------------------------------------------------------------
 // Middleware
+// ---------------------------------------------------------------------------
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
+
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+
 // Health check
-app.get('/', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    message: 'Tellect Waitlist Backend Running',
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'ok',
     usingPostgres,
-    emailCount: emails.length
+    emailCount: usingPostgres ? undefined : memoryEmails.length,
   });
 });
 
-// Submit email to waitlist
-app.post('/api/waitlist', (req, res) => {
+// Submit email to the waitlist
+app.post('/api/waitlist', async (req, res) => {
   const { email } = req.body;
-  
-  if (!email || !email.includes('@')) {
-    return res.status(400).json({ error: 'Valid email required' });
-  }
-  
-  const normalizedEmail = email.toLowerCase().trim();
-  
-  // Check for duplicates
-  const alreadyExists = emails.some(e => e.email === normalizedEmail);
-  if (alreadyExists) {
-    return res.status(409).json({ error: 'Email already on waitlist' });
-  }
-  
-  const entry = {
-    email: normalizedEmail,
-    created_at: new Date().toISOString()
-  };
-  
-  if (usingPostgres) {
-    // Save to Postgres
-    const pool = new Pool({
-      connectionString: process.env.DATABASE_URL || 'postgresql://localhost:5432/tellect_waitlist'
-    });
-    
-    pool.query(
-      'INSERT INTO waitlist_emails (email, created_at) VALUES ($1, $2)',
-      [normalizedEmail, new Date()],
-      (err, result) => {
-        if (err) {
-          console.error('Postgres insert error:', err.message);
-          // Fallback to in-memory
-          emails.push(entry);
-          io?.emit('waitlist:new', entry);
-          return res.json({ success: true, saved: 'memory', email: normalizedEmail });
-        }
-        emails.push(entry);
-        io?.emit('waitlist:new', entry);
-        res.json({ success: true, saved: 'postgres', email: normalizedEmail });
-      }
-    );
-  } else {
-    // In-memory storage
-    emails.push(entry);
-    console.log(`📧 Waitlist entry: ${normalizedEmail}`);
-    res.json({ success: true, saved: 'memory', email: normalizedEmail });
-  }
-});
 
-// Get all waitlist emails (admin endpoint)
-app.get('/api/waitlist', (req, res) => {
-  const uniqueEmails = [...new Set(emails.map(e => e.email))];
-  res.json({ emails: uniqueEmails, count: uniqueEmails.length });
-});
+  if (!email || typeof email !== 'string' || !email.includes('@')) {
+    return res.status(400).json({ error: 'A valid email address is required.' });
+  }
 
-// Reset waitlist (admin)
-app.delete('/api/waitlist', (req, res) => {
-  emails = [];
-  if (usingPostgres) {
-    const pool = new Pool({
-      connectionString: process.env.DATABASE_URL || 'postgresql://localhost:5432/tellect_waitlist'
+  const normalized = email.toLowerCase().trim();
+
+  try {
+    const result = await saveEmail(normalized);
+
+    if (!result.created) {
+      return res.status(409).json({
+        success: false,
+        error: 'This email is already on the waitlist.',
+        email: normalized,
+      });
+    }
+
+    console.log(`📧 Waitlist signup: ${normalized} (${result.saved})`);
+    return res.status(201).json({
+      success: true,
+      email: normalized,
+      saved: result.saved,
     });
-    pool.query('DELETE FROM waitlist_emails', (err, res) => {
-      if (err) console.error(err.message);
+  } catch (err) {
+    console.error('❌ Failed to save waitlist entry:', err.message);
+    return res.status(500).json({
+      success: false,
+      error: 'Could not save your email. Please try again.',
     });
   }
-  res.json({ message: 'Waitlist cleared', count: 0 });
 });
 
-// Start server
-const server = app.listen(PORT, () => {
-  console.log(`🚀 Tellect Waitlist Backend running on port ${PORT}`);
-  console.log(`📍 API endpoint: POST /api/waitlist`);
-  console.log(`🌐 Frontend should point to: http://localhost:${PORT}`);
+// List waitlist emails (admin)
+app.get('/api/waitlist', async (req, res) => {
+  try {
+    const rows = await listEmails();
+    res.json({
+      count: rows.length,
+      usingPostgres,
+      emails: rows.map((r) => r.email),
+      records: rows,
+    });
+  } catch (err) {
+    console.error('❌ Failed to list waitlist:', err.message);
+    res.status(500).json({ error: 'Could not read the waitlist.' });
+  }
 });
 
-// Handle graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('🛑 Shutting down gracefully...');
-  server.close(() => {
-    process.exit(0);
+// Clear the waitlist (admin)
+app.delete('/api/waitlist', async (req, res) => {
+  try {
+    await clearEmails();
+    res.json({ message: 'Waitlist cleared.', count: 0 });
+  } catch (err) {
+    console.error('❌ Failed to clear waitlist:', err.message);
+    res.status(500).json({ error: 'Could not clear the waitlist.' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
+initPostgres().finally(() => {
+  const server = app.listen(PORT, () => {
+    console.log(`🚀 Tellect Waitlist backend listening on port ${PORT}`);
+    console.log(`📍 POST /api/waitlist  •  GET /api/waitlist  •  GET /api/health`);
+    console.log(`🌐 Landing page: http://localhost:${PORT}/`);
+  });
+
+  process.on('SIGTERM', () => {
+    console.log('🛑 Shutting down...');
+    server.close(() => process.exit(0));
   });
 });
 
-// Export for testing
 module.exports = app;
