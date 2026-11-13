@@ -459,12 +459,27 @@
     <p>Tellect Campus &copy; 2026 <a href="#">Tellect</a>. Built for <strong>FUTA</strong>.</p>
   </footer>
 
+  <!-- Runtime API configuration — edit apiBaseUrl here to repoint the API. -->
+  <script src="config.js"></script>
+
   <script>
-    // Backend API base. Update this to match your deployment.
-    const BACKEND_URL =
-      window.location.hostname === 'localhost'
+    // Resolve the waitlist API base URL.
+    // 1. config.js  → runtime config, editable without a rebuild
+    // 2. localhost  → local dev backend
+    // 3. same origin → API served alongside the page
+    // 4. hardcoded backend → last resort if config.js is unavailable
+    const LOCAL_HOSTS = ['localhost', '127.0.0.1', '0.0.0.0'];
+    const FALLBACK_API = 'https://tellect-landing-page-backend.onrender.com';
+    const CONFIG_BASE =
+      (window.TELLECT_CONFIG && window.TELLECT_CONFIG.apiBaseUrl) || '';
+
+    const BACKEND_URL = CONFIG_BASE
+      ? CONFIG_BASE.replace(/\/$/, '')
+      : LOCAL_HOSTS.includes(window.location.hostname)
         ? 'http://localhost:3000'
-        : 'https://tellect-landing-page-backend.onrender.com';
+        : window.location.origin === 'null'
+          ? FALLBACK_API
+          : window.location.origin;
 
     // Form submission
     const form = document.getElementById('waitlistForm');
@@ -532,8 +547,15 @@
         alert(data.error || 'Something went wrong. Please try again.');
         resetSubmitBtn();
       } catch (error) {
-        console.error('Waitlist submission failed:', error);
-        alert('Could not reach the server. Please check your connection and try again.');
+        console.error(
+          'Waitlist submission failed. POST ' + BACKEND_URL + '/api/waitlist',
+          error
+        );
+        alert(
+          'Could not reach the waitlist server.\n\n' +
+            'API: ' + BACKEND_URL + '/api/waitlist\n\n' +
+            'Check your connection and try again.'
+        );
         resetSubmitBtn();
       }
     });
