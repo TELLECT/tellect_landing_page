@@ -1,0 +1,25 @@
+# Render Blueprint — declarative config for the Tellect waitlist service.
+# Reference: https://render.com/docs/blueprint-spec
+#
+# Using this file (Render Dashboard → New → Blueprint):
+#   1. Point it at this repo
+#   2. Render will read the settings below
+#   3. Set DATABASE_URL in the dashboard when prompted (sensitive value)
+
+services:
+  - type: web
+    name: tellect-landing-page-backend
+    runtime: node
+    plan: free
+    region: oregon
+    # Root Directory = backend  →  npm install runs inside ./backend
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: "24.22.1"
+      # Set this in the dashboard — do NOT commit the value.
+      - key: DATABASE_URL
+        sync: false
